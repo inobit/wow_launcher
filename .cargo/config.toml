@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[http]
+# 本机网络环境下 HTTP/2 多路复用会导致 cargo 下载卡死, 强制走 HTTP/1.1
+multiplexing = false
