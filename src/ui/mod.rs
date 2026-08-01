@@ -11,10 +11,20 @@ mod terminal;
 const LOGO_BYTES: &[u8] = include_bytes!("../../assets/icon.png");
 
 /// 静态缓存图标 Handle: image::Handle::from_bytes 每次调用生成唯一 Id,
-/// 若每帧重建会导致纹理缓存失效、图标持续闪烁(终端有输出重绘时更明显)
+/// 若每帧重建会导致纹理缓存失效、图标持续闪烁(终端有输出重绘时更明显)。
+/// 预缩放到 64x64: iced 直接缩放 256 源到 40px 会因无 mipmap 而模糊
 fn logo_handle() -> &'static image::Handle {
     static HANDLE: std::sync::OnceLock<image::Handle> = std::sync::OnceLock::new();
-    HANDLE.get_or_init(|| image::Handle::from_bytes(LOGO_BYTES))
+    HANDLE.get_or_init(|| {
+        let resized = ::image::load_from_memory(LOGO_BYTES)
+            .map(|img| img.resize(64, 64, ::image::imageops::FilterType::Lanczos3))
+            .ok()
+            .map(|img| {
+                let rgba = img.to_rgba8();
+                image::Handle::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
+            });
+        resized.unwrap_or_else(|| image::Handle::from_bytes(LOGO_BYTES))
+    })
 }
 
 pub fn view<'a>(state: &'a State) -> Element<'a, Message> {
@@ -102,13 +112,7 @@ fn sidebar(inner: Element<Message>) -> Element<Message> {
 }
 
 fn build_sidebar<'a>(state: &'a State) -> Element<'a, Message> {
-    let logo = container(image(logo_handle().clone()).width(40).height(40))
-        .style(|_| container::Style {
-            background: Some(iced::Background::Color(theme::CARD)),
-            border: iced::Border::default().rounded(10.0).color(theme::ACCENT).width(1.0),
-            ..Default::default()
-        })
-        .padding(6);
+    let logo = image(logo_handle().clone()).width(40).height(40);
 
     let title = column![
         text("WoW Launcher").size(16),
