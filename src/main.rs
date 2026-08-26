@@ -23,7 +23,8 @@ pub fn main() -> iced::Result {
     // 限制 wgpu 只使用原生图形后端（DX12/Vulkan），避免初始化 OpenGL 后端。
     // 部分 AMD 驱动安装不完整时（System32 缺少 atiglpxx.dll），GL 探测会触发
     // "LoadLibrary failed with error 126" 弹窗并阻塞窗口创建。
-    std::env::set_var("WGPU_BACKEND", "dx12,vulkan");
+    // edition 2024 起 set_var 为 unsafe(进程启动早期单线程调用, 安全)
+    unsafe { std::env::set_var("WGPU_BACKEND", "dx12,vulkan") };
 
     let window_settings = window::Settings {
         size: Size::new(1100.0, 720.0),
