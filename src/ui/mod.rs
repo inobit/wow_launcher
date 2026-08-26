@@ -6,7 +6,7 @@ use crate::theme;
 
 mod home;
 mod settings;
-mod terminal;
+pub(crate) mod terminal;
 
 const LOGO_BYTES: &[u8] = include_bytes!("../../assets/icon.png");
 

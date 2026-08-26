@@ -12,7 +12,8 @@ image = { version = "0.25", features = ["png"], default-features = false }
 rfd = { version = "0.14", features = ["tokio"] }
 futures = "0.3"
 portable-pty = "0.8"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+vt100 = "0.16"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [build-dependencies]
 winres = "0.1"

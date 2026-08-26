@@ -17,11 +17,10 @@ pub const TEXT_MUTED: Color = Color::from_rgb(0.72, 0.72, 0.72);
 pub const TERM_BG: Color = Color::from_rgb8(0x16, 0x16, 0x1E);
 pub const TERM_DEFAULT: Color = Color::from_rgb8(0xC0, 0xCA, 0xF5);
 pub const TERM_MUTED: Color = Color::from_rgb8(0x9A, 0xA5, 0xCE);
-pub const TERM_BLUE: Color = Color::from_rgb8(0x7A, 0xA2, 0xF7);
-pub const TERM_CYAN: Color = Color::from_rgb8(0x7D, 0xCF, 0xFF);
-pub const TERM_GREEN: Color = Color::from_rgb8(0x9E, 0xCE, 0x6A);
 pub const TERM_RED: Color = Color::from_rgb8(0xF7, 0x76, 0x8E);
-pub const TERM_YELLOW: Color = Color::from_rgb8(0xE0, 0xAF, 0x68);
+/// ANSI 黑作前景时的替代色: 纯黑在 TERM_BG 上完全不可见, 用 Tokyo Night 注释灰保证可读
+/// (仅前景路径使用; 背景路径仍用 TERM_ANSI[0] 真黑)
+pub const TERM_FG_BLACK: Color = Color::from_rgb8(0x56, 0x5F, 0x89);
 
 /// ANSI 16 色映射到 Tokyo Night 调色板(索引 0-15)
 pub const TERM_ANSI: [Color; 16] = [
