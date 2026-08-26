@@ -39,7 +39,7 @@ impl ServiceKind {
             ServiceKind::Mysql => "mysqld.exe 完整路径",
             ServiceKind::Auth => "auth_server 可执行文件路径",
             ServiceKind::World => "world_server 可执行文件路径",
-            ServiceKind::Client => "wow.exe 完户端路径",
+            ServiceKind::Client => "wow.exe 客户端路径",
         }
     }
 }
