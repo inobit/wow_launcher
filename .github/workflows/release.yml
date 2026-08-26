@@ -1,0 +1,104 @@
+name: release
+
+# 发版入口：
+#   正式发版 —— push v* tag（如 v0.1.0）
+#   手动兜底 —— workflow_dispatch 指定已存在的 tag 补跑
+#     （GitHub 反递归规则：用默认 GITHUB_TOKEN 推的 tag 不会触发本 workflow，
+#      此时用 `gh workflow run release.yml -f tag=v0.1.0` 手动补跑）
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag(如 v0.1.0), 必须已存在于仓库且格式为 vX.Y.Z"
+        required: true
+        type: string
+
+# 创建 Release + 上传资产的最低权限；组织默认只读时缺它报
+# "Resource not accessible by integration"
+permissions:
+  contents: write
+
+# 同一 tag 并发触发时取消旧 run，防止重复资产竞争
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest    # 唯一目标平台；ConPTY e2e 测试只能在 Windows 跑；自带 MSVC 构建链
+    timeout-minutes: 30        # windows runner 首进程冷启动慢，预算放宽
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      # v7: 最新主版本(node24 运行时)。其 breaking change 仅针对
+      # pull_request_target 拉取 fork PR 的场景, 与本工作流的 tag push/dispatch 无关
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}  # dispatch 兜底时可指定历史 tag 重发
+          fetch-depth: 0                             # 可选的全量历史，为将来切换 git-cliff changelog 预留
+
+      # AGENTS.md §3：必须 stable-x86_64-pc-windows-msvc（-gnu 产物缺 MinGW DLL 报 error 126）。
+      # windows runner host 默认即 msvc ABI，此 action 一行锁定 stable
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 必须放在 toolchain 之后（key 才含工具链信息）。
+      # 已知边界：tag 触发的 run 只能读 main 分支的缓存；本项目 LTO 冷构建约 2-4 分钟，
+      # 此步是锦上添花而非依赖
+      - uses: Swatinem/rust-cache@v2
+
+      # 防呆门禁：tag 必须是严格的 vX.Y.Z 格式。
+      # 该值会流入 zip 文件名与 release tag_name，dispatch 自由输入时必须拦截路径分隔符等非法内容
+      - name: 校验 tag 格式
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') {
+            Write-Error "tag 必须为 vX.Y.Z 格式, 实际收到: '$env:TAG'"
+          }
+
+      # 版本一致性门禁：强制"先改 Cargo.toml version 再打 tag"，防止发错标。
+      # 只在 [package] 段内找 version，避免将来依赖改用多行 table 写法时误匹配
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        shell: pwsh
+        run: |
+          $lines = Get-Content Cargo.toml
+          $pkgStart = [Array]::IndexOf($lines, '[package]')
+          if ($pkgStart -lt 0) { Write-Error "Cargo.toml 缺少 [package] 段" }
+          $ver = $null
+          for ($i = $pkgStart + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\[') { break }
+            if ($lines[$i] -match '^version\s*=\s*"([^"]+)"') { $ver = $Matches[1]; break }
+          }
+          if (-not $ver) { Write-Error "Cargo.toml [package] 段缺少 version" }
+          if ($env:TAG -ne "v$ver") {
+            Write-Error "tag($env:TAG) 与 Cargo.toml 版本($ver)不一致, 请先同步版本号"
+          }
+
+      # 发布门禁：16 项测试含 ConPTY 端到端(spawn 真实子进程)。
+      # 用 --release：test 与后续 build 共享 release 编译产物，总耗时更低
+      - run: cargo test --release --locked
+
+      - run: cargo build --release --locked
+
+      # crt-static 由仓库内 .cargo/config.toml 自动生效，产物为自包含单 exe(~13MB)
+      - name: 打包 zip + SHA256
+        shell: pwsh
+        run: |
+          $name = "wow_launcher-$env:TAG-x86_64"
+          Compress-Archive -Path target/release/wow_launcher.exe `
+            -DestinationPath "$name.zip"
+          # 标准 sha256sum 校验格式 "<hash>␣␣<filename>"(带尾换行), 可直接 sha256sum -c / Get-FileHash 对照
+          "$((Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower())  $name.zip" |
+            Out-File "$name.zip.sha256"
+
+      # 已有同名 release 时更新资产而非报错；generate_release_notes 为 GitHub 内置自动
+      # changelog(PR/贡献者/compare 链接, 后续可用 .github/release.yml 分组)
+      # v3: 当前受支持版本(node24); v2 已停止维护。输入参数与 v2 兼容
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          generate_release_notes: true
+          files: |
+            wow_launcher-*-x86_64.zip
+            wow_launcher-*-x86_64.zip.sha256
