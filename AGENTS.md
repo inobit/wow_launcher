@@ -1,201 +1,134 @@
 # AGENTS.md — WoW Launcher
 
-Rust + iced 桌面启动器，用于一键拉起 WoW 服务端三件套（MySQL / auth_server / world_server）与客户端。
+> 本文档面向 AI 编码代理与新加入的开发者，按 **目标 → 架构 → 常用命令 → 设计约束** 组织。
+> 阅读目标：快速进入开发状态，且**不违反第 4 节任何一条设计约束**（多数约束背后是一次真实事故）。
 
-## 构建命令
+## 1. 项目目标
 
-```powershell
-cargo build --release          # 产物: target\release\wow_launcher.exe
-cargo run                       # 调试运行
-cargo build                     # 快速类型检查
-```
+Windows 桌面启动器（Rust + iced），一键拉起/停止 WoW 服务端三件套与客户端：
 
-- **默认 toolchain 必须为 `stable-x86_64-pc-windows-msvc`**（`rustup default stable-x86_64-pc-windows-msvc`）。需 VS Build Tools 2022+ 的 C++ 桌面开发组件。
-- 项目根 `.cargo\config.toml` 已开启 `target-feature=+crt-static`，CRT 静态链接进 exe，产物自包含、不依赖外部 VCRUNTIME redist。另有 `[http] multiplexing=false`（本机网络下 HTTP/2 多路复用会导致 cargo 下载卡死，必须保留）。
-- LTO + 单 codegen-unit，release 首次构建约 2-4 分钟。
-- **部署**：`cargo build --release` 后复制 `target\release\wow_launcher.exe` 到 `D:\apps\wow_80_tianlan\azbotcore\`（覆盖同目录旧版，需先结束正在运行的启动器）。`wow_launcher.json` 与 exe 同目录，部署时保留。
-
-## 功能说明
-
-启动器管理 4 个应用，按角色分为两类：
-
-| 服务 | 角色 | 终端捕获 | 单独停止/重启 |
+| 应用 | 角色 | 终端捕获 | 单独停止/重启 |
 |------|------|----------|----------------|
-| MySQL (`mysqld.exe`) | 后端服务 | ✅ 有页签 | ✅ 有 |
+| MySQL (`mysqld.exe` 或包装 .bat) | 后端服务 | ✅ 有页签 | ✅ 有 |
 | Auth Server | 后端服务 | ✅ 有页签 | ✅ 有 |
 | World Server | 后端服务 | ✅ 有页签 | ✅ 有 |
 | 客户端 (`wow.exe`) | 独立程序 | ❌ 压制不显示 | ❌ 仅启动 |
 
-核心特性：
+核心用户价值：① 一键按序启动（MySQL 就绪后再起 Auth/World）；② 内置可视化终端（实时彩色输出 + 键盘交互 + 回看）；③ 无论正常退出还是被强杀都不残留孤儿进程。适用范围与使用方法见 `README.md`。
 
-- **配置持久化**：4 个应用路径保存到可执行文件同目录的 `wow_launcher.json`。首次运行无配置时使用空缺省值。
-- **终端输出捕获**：MySQL/Auth/World 通过 **ConPTY 伪终端**（`portable-pty`）启动，子进程 stdout 是真实控制台句柄，输出逐行实时到达且带 ANSI 颜色码（直接跑管道会被 CRT 4KB 块缓冲吞掉，这是 Auth 终端无输出的根因）。按服务分别缓存到 `Vec<String>`，通过 iced Subscription 推送给 UI。客户端 `spawn` 后立即丢弃 handle，输出完全压制。
-- **一键启动**：MySQL → Auth/World 先进入"等待 MySQL 启动…"状态 → 异步轮询 `127.0.0.1:3306`（每 250ms，最长 30s）→ 就绪后 Auth + World 并发启动。停止/失败会取消排队中的服务。
-- **一键停止**：将三个服务 `desired` 置 false（订阅被 drop），同时 `taskkill /PID <pid> /T /F` 杀**进程树**——因为 MySQL 配置指向 `MySQL.bat`，真实进程是 cmd→mysqld 两级，只杀直接子进程会遗留 mysqld 孤儿进程。
-- **单独控制**：每个后端服务卡片有独立停止/重启按钮。重启 = `restart_pending` 标记 + 杀进程树 → 延时 800ms 后自动重新启动，期间状态保持"停止中"不闪烁。
-- **退出保护**：关窗时若有服务在运行，弹确认框（是=停止全部并退出 / 否=取消关闭）；所有服务进程挂入带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的作业对象（`process.rs::job`），启动器无论崩溃还是被强杀，进程树都会被系统强制终止，不残留孤儿。客户端进程不挂作业对象，保持独立。
-- **滚动去重**：每服务独立行缓冲，新行单向 append（带 1500 行上限的 ring drain），`scrollable().auto_scroll(true)` 跟随底部，避免重渲染导致的文字重复。
-- **字体渲染**：默认 `Microsoft YaHei`（中文），终端用 `Font::MONOSPACE`（Consolas/Cascadia）。
-- **终端配色**：Tokyo Night 风格（背景 `#16161E`），解析子进程输出的 ANSI SGR 颜色码（16 色 + 38;5 256 色 + 38;2 真彩色），无颜色码时按关键字着色（error→红 / warning→黄 / note/info→蓝 / system→青 / ready→绿）。
-- **窗口图标**：`assets/icon.png`（由 `icon.jpg` 用 ImageMagick 去白底生成）经 `include_bytes!` 嵌入，运行时解码为 RGBA。
+## 2. 架构
 
-## UI 布局
+### 2.1 总体形态
 
-Win11 风格深色主题，主窗口 1100×720（最小 900×600，可缩放）。
+Elm 架构单体 GUI：`app.rs` 是唯一状态机（State + Message + update/subscription/view），UI 全部是 State 的纯函数投影。子进程生命周期由 **声明式订阅** 管理：`desired[kind] && path_set(kind)` → 存活一个 `Subscription::run_with(ServiceRecipe{kind, path})`；desired=false 订阅即 drop。
+
+### 2.2 终端数据流（核心链路）
 
 ```
-┌────────────┬───────────────────────────────────────┐
-│            │                                       │
-│  [图标]    │                                       │
-│  WoW Launcher│            内容区 (Fill)            │
-│  启动管理器 │     (由左侧导航切换三种视图)          │
-│            │                                       │
-│  ⌂ 主页    │                                       │
-│  ⚙ 配置    │                                       │
-│  ▷ 终端    │                                       │
-│            │                                       │
-│  [状态消息]│                                       │
-└────────────┴───────────────────────────────────────┘
-   208px                     Fill
+spawn(ConPTY) ──► 读线程 read(8KB) ──► vt100::Parser.process ──► version+1
+                     │                                            │
+                     └── push_msg(Message::TerminalData) ──► update: refresh_grid
+                                                                  │ 活动页签才提取
+                                                                  ▼
+                                    snapshot_grid(parser 持锁一次完成: 定位 scrollback
+                                    → 逐 cell 提取颜色/反显/光标 → 还原 offset=0)
+                                                                  ▼
+                                          grids[idx] 缓存(version+offset 失效)
+                                                                  ▼
+                                     terminal.rs view → render_row(rich_text spans)
+
+键盘: KeyPressed(listen_with 全局转发) → encode_key(CSI/SS3/C0/UTF-8) 
+      → TermCmd::Input → 写线程 → PTY writer → 子进程回显 → 同上链路回到屏幕
 ```
 
-### 左侧导航栏（`src/ui/mod.rs`）
+原始字节只进 vt100，`TerminalData` 消息仅作心跳/脏标记。设计细节见 `docs/terminal-input-vt100-emulation.md`。
 
-- 固定宽 208px，深灰底 `#181818`
-- 顶部：圆角图标容器（40px）+ 标题"WoW 启动器/启动管理器"
-- 三个导航按钮：主页 / 配置 / 终端，选中态用 accent 软蓝边框高亮
-- 底部：可选的序列状态消息（一键启动进度等）
-
-### 主页（`src/ui/home.rs`，NavTab::Home）
-
-```
-┌──────────────────────────────────────────────────┐
-│ [▶一键启动] [■一键停止]  运行中服务: N/3         │
-├──────────────────────────────────────────────────┤
-│ ● MySQL        已停止   [停止][重启]             │
-│   D:\...\mysqld.exe                               │
-├──────────────────────────────────────────────────┤
-│ ● Auth Server  运行中    [停止][重启]            │
-│   D:\...\auth_server.exe                          │
-├──────────────────────────────────────────────────┤
-│ ● World Server 已停止    [启动]                  │
-│   D:\...\world_server.exe                         │
-├──────────────────────────────────────────────────┤
-│ ● 客户端                       [启动]            │
-│   D:\...\wow.exe                                  │
-└──────────────────────────────────────────────────┘
-```
-
-- 顶部主操作行：一键启动（accent 蓝）、一键停止（danger 橙）、运行中计数
-- 4 个服务卡片：状态指示灯（● 绿=运行 / 黄=启动中·等待 / 红=错误 / 灰=停止）+ 名称 + 路径 + 状态文字 + 操作按钮
-- 客户端卡片只有"启动"按钮，无停止/重启，且**不显示状态行**（独立进程不追踪）
-- 一键启动需三个后端服务路径均已配置，否则按钮禁用并在状态栏提示
-
-### 配置页（`src/ui/settings.rs`，NavTab::Settings）
-
-```
-┌──────────────────────────────────────────────────┐
-│ 配置应用路径                                      │
-│                                                  │
-│ MySQL       [mysqld.exe 完整路径        ] [浏览…] │
-│             已设置                                │
-│ Auth Server [auth_server 可执行文件路径 ] [浏览…]│
-│             未设置                                │
-│ World Server[world_server 可执行文件路径] [浏览…]│
-│             已设置                                │
-│ 客户端      [wow.exe 客户端路径        ] [浏览…]  │
-│             已设置                                │
-│                                                  │
-│ 客户端只会在主页点击启动后,以独立进程运行,输出不在此捕获。│
-│ [还原]  [保存配置]                                │
-│ [保存结果消息]                                   │
-└──────────────────────────────────────────────────┘
-```
-
-- 编辑的是 `config_draft` 副本，保存才落盘并同步到 `config`
-- "浏览…" 调 `rfd` 异步文件对话框（过滤 .exe）
-- 每行右侧"已设置/未设置"徽标反映 **已保存** 配置（非草稿）状态
-
-### 终端页（`src/ui/terminal.rs`，NavTab::Terminal）
-
-```
-┌──────────────────────────────────────────────────┐
-│ [MySQL] [Auth Server] [World Server]     [清空]  │  ← TabBar(仅3个,无客户端)
-├──────────────────────────────────────────────────┤
-│ 2026-07-30 10:23:01 [Note] mysqld ready          │
-│ 2026-07-30 10:23:02 [Note] X Plugin...           │  ← 等宽字体, auto_scroll
-│ ...                                              │
-└──────────────────────────────────────────────────┘
-```
-
-- 顶部自定义 tab 按钮行：MySQL / Auth / World 三个页签（带状态色圆点），无客户端页签
-- 右侧"清空"按钮清空当前页签日志
-- 终端区 Tokyo Night 深色底 `#16161E`，等宽字体 13px，自动滚动到底；逐行解析 ANSI SGR 颜色（16 色/256 色/真彩色），无颜色码时按关键字着色
-
-## 配色常量（`src/theme.rs`）
-
-| 常量 | 值 | 用途 |
-|------|----|------|
-| `BG` | `#1F1F1F` | 内容区背景 |
-| `SIDEBAR` | `#181818` | 导航栏 |
-| `CARD` | `#2B2B2B` | 服务卡片 |
-| `CARD_BORDER` | `#3D3D3D` | 卡片/输入框边框 |
-| `ACCENT` | `#60CDFF` | 主操作 + 选中高亮（Win11 蓝） |
-| `SUCCESS` | `#6FCE9A` | 运行中 |
-| `DANGER` | `#FF9974` | 停止/错误 |
-| `WARNING` | `#FFC97A` | 启动中/未设置 |
-| `TEXT` | `#F2F2F2` | 主文字 |
-| `TEXT_MUTED` | `#B8B8B8` | 次要文字 |
-
-终端另有 `TERM_*` 系列（Tokyo Night）：`TERM_BG #16161E` / `TERM_DEFAULT #C0CAF5` / `TERM_BLUE #7AA2F7` / `TERM_CYAN #7DCFFF` / `TERM_GREEN #9ECE6A` / `TERM_RED #F7768E` / `TERM_YELLOW #E0AF68` / `TERM_MUTED #9AA5CE`，以及 ANSI 16 色映射表 `TERM_ANSI`。
-
-## 代码结构
+### 2.3 模块地图
 
 ```
 src/
-├── main.rs              # 入口；application builder；窗口/图标/字体/订阅；load_icon()
-├── app.rs               # State、Message、update()、view()、subscription();核心 Elm 状态机
-├── config.rs            # Config 结构 + JSON 读写(同目录 wow_launcher.json);path_for/set/path_set
-├── service.rs           # ServiceKind 枚举(MySQL/Auth/World/Client)+ index/label/placeholder;Status 枚举
-├── process.rs           # 进程生命周期:service_subscription(ConPTY 流)、job(作业对象)、kill_tree(taskkill 树杀)、wait_mysql_ready(TCP 轮询)、launch_client、delay_restart、browse_path
-├── theme.rs             # 颜色常量 + 按钮风格函数(accent/danger/ghost/nav/tab)
+├── main.rs              # 入口; 窗口设置(exit_on_close_request:false 必须为 false)/图标/字体
+├── app.rs               # Elm 状态机; 一键启动序列; 滚动/resize 防抖; 关闭确认流程
+├── config.rs            # wow_launcher.json 读写(exe 同目录)
+├── service.rs           # ServiceKind(MySQL/Auth/World/Client) + Status 枚举
+├── process.rs           # ConPTY 订阅流(三线程)+作业对象+kill_tree+wait_mysql_ready
+│                        # +grid_size_for_window(网格几何常量)+input::encode_key(键盘编码,14 单测)
+├── theme.rs             # 配色常量(Tokyo Night TERM_* + TERM_ANSI 16色表) + 按钮风格
 └── ui/
-    ├── mod.rs           # 总布局:左导航 + 右内容;build_sidebar();close_dialog(关闭确认弹窗);logo_handle(静态图标缓存)
-    ├── home.rs          # 主页:一键按钮 + 4 服务卡片
-    ├── settings.rs      # 配置页:4 路径行 + 保存/还原
-    └── terminal.rs      # 终端页:3 页签 + ANSI 解析 + auto_scroll 日志
-assets/icon.png          # 去白底后的透明 PNG 窗口图标(由 icon.jpg 生成)
-.cargo/config.toml       # msvc crt-static 静态链接配置
-wow_launcher.json        # 运行时生成；4 服务路径(运行后落盘)
+    ├── mod.rs           # 左导航(208px)+内容区; 关闭确认弹窗(stack 覆盖层); 图标静态缓存
+    ├── home.rs          # 一键按钮 + 4 服务卡片(状态灯)
+    ├── settings.rs      # 路径配置(config_draft 草稿→保存落盘)
+    └── terminal.rs      # 3 页签+状态圆点+GridSnapshot 提取/渲染+错误覆盖层
 ```
 
-## 关键实现细节
+### 2.4 关键机制
 
-### 进程管理模型（ Elm + 声明式订阅）
+- **进程树管理**：spawn 后立即挂作业对象（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，崩溃/强杀兜底）；主动停止走 `taskkill /PID x /T /F` 树杀（MySQL.bat 是 cmd→mysqld 两级）。订阅 drop 的通道断连只杀直接子进程——所以**一切主动停止必须走 kill_tree**。
+- **一键启动**：MySQL `Starting` + Auth/World `Waiting` → `wait_mysql_ready()` 每 250ms 连接 `127.0.0.1:3306`（400ms 超时 ×120 次=30s）→ `MysqlReady` 后 Waiting 服务并发转 Starting。
+- **重启**：`restart_pending=true` + 树杀 → `ProcessKilled` → 延时 800ms → `SetDesired(true)`（同时置 `restart_marker=true`）→ 新会话就绪后注入 `--- 已重启 ---` 标记行。期间点停止会清标记使延时任务失效。
+- **退出保护**：`exit_on_close_request:false`（否则 CloseRequested 不转发）→ `listen_with` 拦截 → 有运行中服务则弹确认框 → `ConfirmClose(true)` → stop_all + 无 kill 任务时立即检查 `maybe_close_after_stop`（防止 Starting 未回报 pid 时窗口卡死）。
+- **滚动回看**：固定 rows×cols 网格快照，**不用 scrollable**；vt100 内部 2000 行 scrollback；offset=0 实时屏；回看时按 scrollback 增量补偿锚定；像素滚轮残量跨事件累积（`wheel_remainder`）。
 
-`app::subscription(state)` 根据 `state.desired[kind] && path_set(kind)` 为每个后端服务返回一个 `Subscription::run_with`。desired=true 时订阅存活；desired=false 时订阅被 drop → UI 通道关闭 → 读线程 `push_msg` 失败 → kill 直接子进程，同时 `update()` 侧用 `taskkill /T /F` 杀**进程树**（`kill_tree`，防 cmd→mysqld 两级包装残留孤儿进程），完成后发 `ProcessKilled`。`pids[kind]` 记录各服务直接子进程 PID，`restart_pending[kind]` 标记重启流程（重启 = 树杀 → 延时 800ms → `SetDesired(true)` 重新 spawn；期间用户点"停止"会清标记使延时任务失效）。
+## 3. 常用命令
 
-### stdout 捕获（`process.rs::build_service_stream`）
+```powershell
+cargo build                 # 快速类型检查
+cargo test                  # 16 项测试: 键盘编码 14 + ConPTY 端到端 + 终端快照回归 ×2
+cargo run                   # 调试运行 GUI
+cargo build --release       # 产物 target\release\wow_launcher.exe (LTO, 约 2-4 分钟)
 
-`stream::channel` 内用 `portable-pty` 开 ConPTY 伪终端（50 行 × 160 列）spawn 子进程，`cwd` 设为可执行文件所在目录（保证 .bat/.conf 相对路径解析）。子进程退出由监控线程 `try_wait` 轮询（100ms），退出后关闭 HPCON → 读端 EOF；阻塞读线程把输出按 `\n` 分行（trim `\r`，跳过空行），经 futures mpsc 转发 `Message::ServiceOutput`，结束发 `ServiceStopped`。原始 ANSI 颜色码原样透传，由 UI 解析渲染。
+# 部署(先结束正在运行的启动器; wow_launcher.json 与 exe 同目录, 保留勿删):
+Copy-Item target\release\wow_launcher.exe D:\apps\wow_80_tianlan\azbotcore\ -Force
 
-### 一键启动序列（`app.rs::update`）
+# 终端输入链路诊断日志(WOW_LAUNCHER_DEBUG=1 时写 exe 同目录 wow_launcher_debug.log):
+$env:WOW_LAUNCHER_DEBUG="1"; cargo run
 
-1. `StartAll` → 校验三路径 → MySQL `desired=true` + `Starting`（已在运行则跳过）→ Auth/World 进入 `Waiting`（"等待 MySQL 启动…"，卡片提供"停止"可取消排队）→ 返回 `wait_mysql_ready()` task
-2. `MysqlReady`（且 `sequence_active` 仍为 true）→ 仍处 `Waiting` 的 Auth/World 同时 `desired=true` + `Starting` → 各自订阅自动 spawn
-3. `MysqlReadyFailed(e)` → MySQL 置 Error + 清 pid，Auth/World 从 Waiting 回 Stopped
+# 重新生成窗口图标:
+magick icon.jpg -fuzz 20% -transparent white -trim assets/icon.png
+```
 
-`wait_mysql_ready` 每 250ms 用 `tokio::net::TcpStream::connect("127.0.0.1:3306")`(400ms 超时)尝试连接，最多 120 次(30s)。
+Toolchain 必须 `stable-x86_64-pc-windows-msvc`（-gnu 产物缺 MinGW DLL 报 error 126）。
 
-### 退出保护（`app.rs` + `process.rs::job`）
+## 4. 设计约束（改动前必读）
 
-`main.rs` 窗口设置必须 `exit_on_close_request: false`——iced_winit 默认收到 `CloseRequested` 会**直接关窗**而不转发事件，拦截订阅将永远收不到。`subscription` 里 `iced::event::listen_with` 拦截 `WindowEvent::CloseRequested` → `Message::CloseRequested`：有服务在运行则 `close_pending=true` 弹确认框（`ui::close_dialog`，stack 覆盖层），否=取消关闭；是=`ConfirmClose(true)` → `stop_all()` 杀全部进程树 → 每个 `ProcessKilled` 后经 `maybe_close_after_stop` 检查，全部 PID 清空后 `iced::window::close(id)`。子进程 spawn 后立即 `job::assign(pid)` 挂入全局单例作业对象（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`），启动器崩溃/被杀时系统自动终止整个进程树；进程已属其他作业时静默失败（仅优雅关闭兜底）。
+### 4.1 终端几何与渲染
 
-## 常见问题排查
+1. **CELL_H 必须等于真实行高 `13.0×1.3=16.9`**。iced 0.14 默认 `LineHeight::Relative(1.3)`，`render_row` 必须显式 `.line_height(1.3)` 与 process.rs 的 CELL_H 对齐。曾因按 1.2 倍估算导致底部行溢出被裁——症状就是"光标/输入回显消失"。宁可少算行列，不可溢出。
+2. **CHROME_W/CHROME_H 必须与 ui 布局联动**（侧边栏 208 + 内容容器 padding 48 + 页签行 ~35 + 间距 10 + 终端容器 padding 24 + 边框 2 + 余量）。改 `ui/mod.rs`/`terminal.rs` 布局后必须复核这两组常量。
+3. **rich_text 必须 `.wrapping(Wrapping::None)`**：默认 Word 换行会让超宽行折行，纵向网格整体错位。
+4. **光标只在实时屏（offset==0）渲染**，历史视图无光标（标准终端语义）；光标用 **`█` 实心块 + 该格前景色**，不得依赖 span 背景高亮（空白格背景盒部分后端不渲染）。
+5. **错误通知必须是叠加在网格上的覆盖层**，不得占网格行高（否则无错误时白白损失终端行数）。
+6. ANSI 黑作前景时映射 `TERM_FG_BLACK`（注释灰），纯黑在 `TERM_BG` 深底上不可见；背景路径仍用真黑。
 
-- **启动报 error 126 / 找不到模块**：确认用 msvc toolchain 且 `.cargo/config.toml` 的 crt-static 生效；-gnu toolchain 产物会因缺 MinGW DLL 触发 126。
-- **关窗无确认提示**：确认 `main.rs` 窗口设置里 `exit_on_close_request: false`（iced_winit 默认 true 时 CloseRequested 直接关窗、不转发事件）。
-- **图标不显示**：确认 `assets/icon.png` 存在且是有效 PNG（RGBA）。
-- **一键启动按钮灰色**：MySQL/Auth/World 三个路径必须全部在配置页保存后才会启用。
-- **修改源码后重新构建**：若 `cargo clean` 报 os error 32，先在任务管理器结束残留 `wow_launcher.exe`。
-- **生成图标**：`magick icon.jpg -fuzz 20% -transparent white -trim assets/icon.png`
+### 4.2 进程与订阅生命周期
+
+7. **PTY 尺寸绝不进 ServiceRecipe**——recipe 是订阅身份，含尺寸会让每次 resize 触发订阅重建 = 进程重启。
+8. **ClearTerminal 注入 `ESC[2J ESC[3J ESC[H` 就地清屏，绝不替换 parser Arc**——替换后读线程仍写旧 Parser，清空一次即永久失显。
+9. 一切主动停止/重启/保存配置变更路径都必须走 `kill_tree` 树杀；订阅 drop 只杀直接子进程，.bat 包装场景会留孤儿抢端口。
+10. 进程退出后先 drain 再关 HPCON（监控线程等 version 连续 200ms 无变化，上限 1s）——ConPTY 异步渲染的尾部输出（往往是崩溃信息）否则丢失。
+11. `push_msg` 重试必须退避且**全程不持锁**，仅在确认断连时瞬时取锁 kill 子进程。
+12. resize 链路：任意页签都要应用 resize；`try_send(Resize)` 失败要保留 pending 重试（否则 applied_grid 去重会永久吞掉该尺寸）；resize 成功后写线程发 TerminalData 心跳触发重提取。
+
+### 4.3 构建与环境
+
+13. `.cargo/config.toml` 的 `[http] multiplexing=false` 必须保留（本机网络下 HTTP/2 多路复用会使 cargo 下载卡死）；`crt-static` 保证产物自包含。
+14. `main.rs` 窗口设置 `exit_on_close_request: false` 必须保留（见 §2.4 退出保护）。
+15. `main.rs` 中 `WGPU_BACKEND=dx12,vulkan` 防 AMD 残缺驱动 GL 探测失败。
+
+### 4.4 代码约定
+
+16. 代码注释中文、文档注释 Google 风格中文；日志消息英文。
+17. 新功能优先补测试；bug 修复带回归测试（参考 `terminal.rs` 的滚动语义测试、`process.rs` 的 encode_key 测试组）。
+18. 改终端相关代码前先读 `docs/terminal-input-vt100-emulation.md` 与本文档第 2.2/4.1 节。
+
+## 5. 排查速查
+
+| 症状 | 先查 |
+|---|---|
+| 光标/输入回显不可见 | §4.1-1/2 行高与 CHROME 常量；开 WOW_LAUNCHER_DEBUG 看 [ready]/[key]/[enc]/[pty] |
+| 某 tab 无法滚动 | 输出是否不足一屏（scrollback 为空属正常）；vt100 set_size 是否扰动过 scrollback |
+| 启动报 error 126 | toolchain 是否 msvc、crt-static 是否生效 |
+| 关窗无确认弹窗 | `exit_on_close_request: false` 是否还在 |
+| 一键启动按钮灰色 | 三条后端路径是否都已保存 |
+| cargo clean os error 32 | 任务管理器结束残留 wow_launcher.exe |
+| Auth 终端完全无输出 | 必须经 ConPTY；普通管道会被 CRT 4KB 缓冲吞掉（历史根因） |
